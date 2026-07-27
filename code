@@ -1,0 +1,243 @@
+"""
+CodeBeamer Data Fetch Tool - Tkinter GUI
+------------------------------------------
+Paste Test Case / Requirement / CUR links, click Fetch, and it pulls
+Name + Description from each using Playwright (reusing a saved login
+session, so no API needed).
+
+SETUP (run once):
+    pip install playwright
+    playwright install chromium
+
+USAGE:
+    python cb_fetch_gui.py
+
+FIRST RUN:
+    A Chrome window will open behind the GUI. If CodeBeamer asks you to
+    log in, log in there. Your session is then saved in ./cb_browser_profile
+    so future runs won't ask again (until the session expires).
+"""
+
+import os
+import threading
+import tkinter as tk
+from tkinter import ttk, scrolledtext, messagebox
+
+from playwright.sync_api import sync_playwright
+
+PROFILE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cb_browser_profile")
+
+
+# ---------------------------------------------------------------------------
+# Scraping logic (same approach as the standalone script)
+# ---------------------------------------------------------------------------
+def fetch_item_fields(page, url: str) -> dict:
+    page.goto(url, wait_until="networkidle", timeout=60000)
+    page.wait_for_timeout(1500)
+
+    result = {"url": url, "name": None, "description": None}
+
+    name_selectors = [
+        "h1",
+        "[class*='trackerItemTitle']",
+        "[class*='item-title']",
+        "[data-testid*='name']",
+        ".cb-item-header h1",
+    ]
+    for sel in name_selectors:
+        try:
+            el = page.locator(sel).first
+            if el.count() > 0:
+                text = el.inner_text(timeout=2000).strip()
+                if text:
+                    result["name"] = text
+                    break
+        except Exception:
+            continue
+
+    try:
+        label = page.locator("text=Description").first
+        if label.count() > 0:
+            candidates = [
+                "xpath=following::*[self::div or self::td or self::p][1]",
+                "xpath=../following-sibling::*[1]",
+                "xpath=ancestor::tr[1]/following-sibling::tr[1]//td",
+            ]
+            for xp in candidates:
+                try:
+                    desc_el = label.locator(xp).first
+                    if desc_el.count() > 0:
+                        text = desc_el.inner_text(timeout=2000).strip()
+                        if text and len(text) > 3:
+                            result["description"] = text
+                            break
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    if not result["description"]:
+        fallback_selectors = [
+            "[class*='description'] .cb-field-value",
+            "[class*='Description'] [class*='value']",
+            "textarea[name*='description']",
+        ]
+        for sel in fallback_selectors:
+            try:
+                el = page.locator(sel).first
+                if el.count() > 0:
+                    text = el.inner_text(timeout=2000).strip()
+                    if text:
+                        result["description"] = text
+                        break
+            except Exception:
+                continue
+
+    return result
+
+
+def run_fetch_job(links: dict, on_result, on_error, on_done):
+    """
+    Runs in a background thread. Launches Playwright, fetches each link,
+    and reports back to the GUI thread via the callbacks (which schedule
+    updates using root.after()).
+    """
+    try:
+        with sync_playwright() as p:
+            context = p.chromium.launch_persistent_context(
+                PROFILE_DIR,
+                headless=False,
+            )
+            page = context.new_page()
+
+            first_time = not os.path.exists(os.path.join(PROFILE_DIR, "Default"))
+            if first_time:
+                on_error(
+                    "First run detected: a browser window has opened. "
+                    "Log into CodeBeamer there if asked, then click Fetch again "
+                    "once the page looks normal (this window can stay open)."
+                )
+
+            for label, url in links.items():
+                if not url:
+                    continue
+                try:
+                    data = fetch_item_fields(page, url)
+                except Exception as e:
+                    data = {"url": url, "name": None, "description": f"Error: {e}"}
+                on_result(label, data)
+
+            context.close()
+    except Exception as e:
+        on_error(f"Fatal error launching browser: {e}")
+    finally:
+        on_done()
+
+
+# ---------------------------------------------------------------------------
+# GUI
+# ---------------------------------------------------------------------------
+class CBFetchApp:
+    def __init__(self, root):
+        self.root = root
+        root.title("CodeBeamer Fetch Tool")
+        root.geometry("800x650")
+
+        pad = {"padx": 8, "pady": 4}
+
+        input_frame = ttk.Frame(root)
+        input_frame.pack(fill="x", **pad)
+
+        self.entries = {}
+        for row, label in enumerate(["Test Case link", "Requirement link", "CUR link"]):
+            ttk.Label(input_frame, text=label + ":").grid(row=row, column=0, sticky="w", **pad)
+            entry = ttk.Entry(input_frame, width=90)
+            entry.grid(row=row, column=1, sticky="we", **pad)
+            self.entries[label] = entry
+        input_frame.columnconfigure(1, weight=1)
+
+        btn_frame = ttk.Frame(root)
+        btn_frame.pack(fill="x", **pad)
+        self.fetch_btn = ttk.Button(btn_frame, text="Fetch", command=self.on_fetch_click)
+        self.fetch_btn.pack(side="left", **pad)
+        self.status_label = ttk.Label(btn_frame, text="Ready.")
+        self.status_label.pack(side="left", **pad)
+
+        # Results notebook: one tab per item type
+        self.notebook = ttk.Notebook(root)
+        self.notebook.pack(fill="both", expand=True, **pad)
+
+        self.result_widgets = {}
+        for label in ["Test Case", "Requirement", "CUR"]:
+            frame = ttk.Frame(self.notebook)
+            self.notebook.add(frame, text=label)
+
+            ttk.Label(frame, text="Name:").pack(anchor="w", padx=6, pady=(6, 0))
+            name_var = tk.StringVar(value="-")
+            ttk.Label(frame, textvariable=name_var, wraplength=740, foreground="#1a1a1a").pack(
+                anchor="w", padx=6, pady=(0, 6)
+            )
+
+            ttk.Label(frame, text="Description:").pack(anchor="w", padx=6)
+            desc_box = scrolledtext.ScrolledText(frame, wrap="word", height=20)
+            desc_box.pack(fill="both", expand=True, padx=6, pady=6)
+            desc_box.configure(state="disabled")
+
+            self.result_widgets[label] = {"name_var": name_var, "desc_box": desc_box}
+
+    def set_status(self, text):
+        self.status_label.config(text=text)
+
+    def on_fetch_click(self):
+        map_ui_to_job_key = {
+            "Test Case link": "Test Case",
+            "Requirement link": "Requirement",
+            "CUR link": "CUR",
+        }
+        links = {}
+        for ui_label, job_key in map_ui_to_job_key.items():
+            links[job_key] = self.entries[ui_label].get().strip()
+
+        if not any(links.values()):
+            messagebox.showwarning("Missing input", "Please paste at least one link.")
+            return
+
+        self.fetch_btn.config(state="disabled")
+        self.set_status("Fetching... (a browser window will open)")
+
+        def on_result(label, data):
+            self.root.after(0, self._update_result, label, data)
+
+        def on_error(msg):
+            self.root.after(0, self._show_error, msg)
+
+        def on_done():
+            self.root.after(0, self._fetch_done)
+
+        thread = threading.Thread(
+            target=run_fetch_job, args=(links, on_result, on_error, on_done), daemon=True
+        )
+        thread.start()
+
+    def _update_result(self, label, data):
+        widgets = self.result_widgets[label]
+        widgets["name_var"].set(data.get("name") or "(not found - selector may need adjusting)")
+        desc_box = widgets["desc_box"]
+        desc_box.configure(state="normal")
+        desc_box.delete("1.0", tk.END)
+        desc_box.insert(tk.END, data.get("description") or "(not found - selector may need adjusting)")
+        desc_box.configure(state="disabled")
+        self.set_status(f"Updated: {label}")
+
+    def _show_error(self, msg):
+        messagebox.showinfo("Notice", msg)
+
+    def _fetch_done(self):
+        self.fetch_btn.config(state="normal")
+        self.set_status("Done.")
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = CBFetchApp(root)
+    root.mainloop()
