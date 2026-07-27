@@ -29,10 +29,96 @@ PROFILE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cb_brows
 
 
 # ---------------------------------------------------------------------------
+# Auto-login helper
+# ---------------------------------------------------------------------------
+def is_login_page(page) -> bool:
+    """Detect if the current page is a login form (has a password field)."""
+    try:
+        return page.locator("input[type='password']").first.count() > 0
+    except Exception:
+        return False
+
+
+def attempt_login(page, username: str, password: str) -> bool:
+    """
+    Tries a handful of common CodeBeamer/enterprise login field selectors.
+    Returns True if it believes login was submitted successfully.
+    """
+    if not username or not password:
+        return False
+
+    username_selectors = [
+        "#user", "input[name='user']",
+        "#j_username", "input[name='j_username']",
+        "input[name='username']", "#username",
+        "input[type='email']",
+    ]
+    password_selectors = [
+        "#pass", "input[name='pass']",
+        "#j_password", "input[name='j_password']",
+        "input[type='password']",
+    ]
+    submit_selectors = [
+        "#loginButton", "button[type='submit']",
+        "input[type='submit']", "text=Log in", "text=Login", "text=Sign in",
+    ]
+
+    filled_user = False
+    for sel in username_selectors:
+        try:
+            el = page.locator(sel).first
+            if el.count() > 0:
+                el.fill(username)
+                filled_user = True
+                break
+        except Exception:
+            continue
+
+    filled_pass = False
+    for sel in password_selectors:
+        try:
+            el = page.locator(sel).first
+            if el.count() > 0:
+                el.fill(password)
+                filled_pass = True
+                break
+        except Exception:
+            continue
+
+    if not (filled_user and filled_pass):
+        return False
+
+    for sel in submit_selectors:
+        try:
+            el = page.locator(sel).first
+            if el.count() > 0:
+                el.click(timeout=3000)
+                page.wait_for_load_state("networkidle", timeout=20000)
+                return True
+        except Exception:
+            continue
+
+    # Fallback: press Enter in the password field
+    try:
+        page.locator("input[type='password']").first.press("Enter")
+        page.wait_for_load_state("networkidle", timeout=20000)
+        return True
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Scraping logic (same approach as the standalone script)
 # ---------------------------------------------------------------------------
-def fetch_item_fields(page, url: str) -> dict:
+def fetch_item_fields(page, url: str, username: str = "", password: str = "") -> dict:
     page.goto(url, wait_until="networkidle", timeout=60000)
+    page.wait_for_timeout(1000)
+
+    # If CodeBeamer bounced us to a login page, try to auto-login then retry.
+    if is_login_page(page):
+        logged_in = attempt_login(page, username, password)
+        if logged_in:
+            page.goto(url, wait_until="networkidle", timeout=60000)
     page.wait_for_timeout(1500)
 
     result = {"url": url, "name": None, "description": None}
@@ -96,11 +182,11 @@ def fetch_item_fields(page, url: str) -> dict:
     return result
 
 
-def run_fetch_job(links: dict, on_result, on_error, on_done):
+def run_fetch_job(links: dict, username: str, password: str, on_result, on_error, on_done):
     """
-    Runs in a background thread. Launches Playwright, fetches each link,
-    and reports back to the GUI thread via the callbacks (which schedule
-    updates using root.after()).
+    Runs in a background thread. Launches Playwright, logs in if needed,
+    fetches each link, and reports back to the GUI thread via callbacks
+    (which schedule updates using root.after()).
     """
     try:
         with sync_playwright() as p:
@@ -110,19 +196,17 @@ def run_fetch_job(links: dict, on_result, on_error, on_done):
             )
             page = context.new_page()
 
-            first_time = not os.path.exists(os.path.join(PROFILE_DIR, "Default"))
-            if first_time:
-                on_error(
-                    "First run detected: a browser window has opened. "
-                    "Log into CodeBeamer there if asked, then click Fetch again "
-                    "once the page looks normal (this window can stay open)."
-                )
-
             for label, url in links.items():
                 if not url:
                     continue
                 try:
-                    data = fetch_item_fields(page, url)
+                    data = fetch_item_fields(page, url, username, password)
+                    if is_login_page(page):
+                        data["description"] = (
+                            "Still on login page - auto-login may have failed. "
+                            "Check username/password, or the login form fields "
+                            "may use different selectors than expected."
+                        )
                 except Exception as e:
                     data = {"url": url, "name": None, "description": f"Error: {e}"}
                 on_result(label, data)
@@ -145,6 +229,19 @@ class CBFetchApp:
 
         pad = {"padx": 8, "pady": 4}
 
+        # --- Login credentials ---
+        login_frame = ttk.LabelFrame(root, text="CodeBeamer Login (used only if you get bounced to a login page)")
+        login_frame.pack(fill="x", **pad)
+
+        ttk.Label(login_frame, text="Username:").grid(row=0, column=0, sticky="w", **pad)
+        self.username_entry = ttk.Entry(login_frame, width=30)
+        self.username_entry.grid(row=0, column=1, sticky="w", **pad)
+
+        ttk.Label(login_frame, text="Password:").grid(row=0, column=2, sticky="w", **pad)
+        self.password_entry = ttk.Entry(login_frame, width=30, show="*")
+        self.password_entry.grid(row=0, column=3, sticky="w", **pad)
+
+        # --- Links ---
         input_frame = ttk.Frame(root)
         input_frame.pack(fill="x", **pad)
 
@@ -202,6 +299,9 @@ class CBFetchApp:
             messagebox.showwarning("Missing input", "Please paste at least one link.")
             return
 
+        username = self.username_entry.get().strip()
+        password = self.password_entry.get()
+
         self.fetch_btn.config(state="disabled")
         self.set_status("Fetching... (a browser window will open)")
 
@@ -215,7 +315,9 @@ class CBFetchApp:
             self.root.after(0, self._fetch_done)
 
         thread = threading.Thread(
-            target=run_fetch_job, args=(links, on_result, on_error, on_done), daemon=True
+            target=run_fetch_job,
+            args=(links, username, password, on_result, on_error, on_done),
+            daemon=True,
         )
         thread.start()
 
